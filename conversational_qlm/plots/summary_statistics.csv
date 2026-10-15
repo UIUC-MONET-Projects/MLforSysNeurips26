@@ -1,0 +1,13 @@
+Experiment,Name,System,Requests,Sched Delay (ms) - Mean,Sched Delay (ms) - P50,Sched Delay (ms) - P99,Queue Length - Mean,Queue Length - Max
+E1.1,vLLM Baseline,vLLM,120,17.54,16.16,151.16,0.03,1
+E1.2,QLM Baseline,QLM,120,16.55,16.66,47.43,0.04,1
+E1.3,vLLM High Rate,vLLM,276,34.83,31.92,51.06,11.08,24
+E1.4,QLM High Rate,QLM,286,33.6,32.06,55.8,9.19,16
+E1.5,vLLM Bursty,vLLM,150,30.03,31.25,52.24,1.09,5
+E1.6,QLM Bursty,QLM,150,29.32,31.52,49.77,1.1,4
+E1.7,vLLM Multi-User,vLLM,287,33.21,32.39,50.43,334.13,674
+E1.8,QLM Multi-User,QLM,290,33.18,31.98,49.59,330.23,672
+E1.9,vLLM Short,vLLM,120,16.53,19.29,37.04,0.04,1
+E1.10,QLM Short,QLM,120,16.28,15.6,45.58,0.03,1
+E1.11,vLLM Long,vLLM,120,19.35,17.58,110.35,0.04,1
+E1.12,QLM Long,QLM,120,15.05,15.66,50.21,0.04,1

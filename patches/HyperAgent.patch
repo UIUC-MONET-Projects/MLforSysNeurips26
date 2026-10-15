@@ -1,0 +1,542 @@
+diff --git a/scripts/run_swe_bench.py b/scripts/run_swe_bench.py
+index 7e24876f504ce8a4f025d6b202f844ea8f549796..266c2e3dc505d2bdf5fa505370c59d4c89544e4a 100755
+--- a/scripts/run_swe_bench.py
++++ b/scripts/run_swe_bench.py
+@@ -1,6 +1,7 @@
+ from hyperagent import HyperAgent
+ from argparse import ArgumentParser
+ from hyperagent.tasks.github_issue_resolve import SWEBench
++from hyperagent.continuum import build_continuum_llm_configs
+ import json
+ import os
+ import json
+@@ -11,16 +12,42 @@ def get_args():
+     parser.add_argument("--split", type=str, default="verified")
+     parser.add_argument("--output_folder", type=str, default="outputs/")
+     parser.add_argument("--model_nick_name", type=str, default="claude-mini")
++    parser.add_argument(
++        "--backend",
++        choices=["anthropic", "continuum"],
++        default="anthropic",
++        help="Use the original Anthropic config or a vLLM-Continuum server.",
++    )
++    parser.add_argument(
++        "--continuum_base_url",
++        type=str,
++        default=os.environ.get("HYPERAGENT_CONTINUUM_BASE_URL",
++                               "http://127.0.0.1:8000/v1"),
++    )
++    parser.add_argument(
++        "--continuum_model",
++        type=str,
++        default=os.environ.get("HYPERAGENT_CONTINUUM_MODEL",
++                               "Qwen/Qwen2.5-Coder-14B-Instruct"),
++    )
++    parser.add_argument(
++        "--continuum_metrics_folder",
++        type=str,
++        default="results/hyperagent_continuum_metrics",
++        help="Folder for per-instance live HyperAgent LLM metrics JSON.",
++    )
++    parser.add_argument(
++        "--instance_ids",
++        type=str,
++        default="",
++        help="Comma-separated SWE-bench instance ids to run, e.g. "
++        "astropy__astropy-12907,django__django-10097.",
++    )
+     return parser.parse_args()
+ 
+-def main():
+-    args = get_args()
+-
+-    subprocess.run(["sudo", "rm", "-rf", "data/repos"])
+-    subprocess.run(["sudo", "mkdir", "-p", "data/repos"])
+-    subprocess.run(["sudo", "chmod", "777", "data/repos"])
+ 
+-    config = {
++def build_anthropic_config():
++    return {
+         "name": "claude",
+         "nav": [{
+             "model": "claude-3-haiku-20240307",
+@@ -54,13 +81,62 @@ def main():
+         }],
+         "type": "patch"
+     }
++
++
++def selected_indices(task, instance_ids: str):
++    requested = {item.strip() for item in instance_ids.split(",") if item.strip()}
++    if not requested:
++        return list(range(len(task)))
++
++    indices = []
++    seen = set()
++    for idx in range(len(task)):
++        _, _, instance_id, _ = task[idx]
++        if instance_id in requested:
++            indices.append(idx)
++            seen.add(instance_id)
++
++    missing = sorted(requested - seen)
++    if missing:
++        print(f"[warn] requested instance ids not found in split/images: {missing}")
++    return indices
++
++
++def main():
++    args = get_args()
++    os.makedirs(args.output_folder, exist_ok=True)
++    if args.backend == "continuum":
++        os.makedirs(args.continuum_metrics_folder, exist_ok=True)
++
++    subprocess.run(["sudo", "rm", "-rf", "data/repos"])
++    subprocess.run(["sudo", "mkdir", "-p", "data/repos"])
++    subprocess.run(["sudo", "chmod", "777", "data/repos"])
++
++    if args.backend == "continuum":
++        os.environ["HYPERAGENT_CONTINUUM_ENABLED"] = "1"
++        config = build_continuum_llm_configs(
++            model=args.continuum_model,
++            base_url=args.continuum_base_url,
++        )
++    else:
++        config = build_anthropic_config()
+     
+     task = SWEBench(logdir="results/swe_bench", split=args.split)
+-    for idx in range(len(task)):
++    indices = selected_indices(task, args.instance_ids)
++    print(f"[info] running {len(indices)} SWE-bench instance(s)")
++
++    for idx in indices:
+         repo_link, commit, instance_id, image_name = task[idx]
+         success = False
+         retry = 0
+         while success != True:
++            continuum_metrics_path = None
++            if args.backend == "continuum":
++                continuum_metrics_path = os.path.join(
++                    args.continuum_metrics_folder,
++                    f"{instance_id}.retry{retry}.metrics.json",
++                )
++
+             pilot = HyperAgent(
+                 repo_path=repo_link,
+                 commit=commit,
+@@ -68,7 +144,9 @@ def main():
+                 clone_dir="data/repos",
+                 llm_configs=config,
+                 image_name=image_name,
+-                verbose=1
++                verbose=1,
++                continuum_job_id=instance_id,
++                continuum_metrics_path=continuum_metrics_path,
+             )
+             try:
+                 patch = task.run(pilot, idx)
+diff --git a/src/hyperagent/agents/llms.py b/src/hyperagent/agents/llms.py
+index 7cdec6629c5cc9144eceffe5a21f095da4d645bd..8f11d4688a818799c5e75de816dc30a8528ab94e 100644
+--- a/src/hyperagent/agents/llms.py
++++ b/src/hyperagent/agents/llms.py
+@@ -46,8 +46,25 @@ class GroqLLM(LLM):
+ class LocalLLM(LLM):
+     def __init__(self, config):
+         super().__init__(config)
+-        openai_api_key = os.environ["TOGETHER_API_KEY"]
+-        openai_api_base = "https://api.together.xyz"
++        if os.environ.get("HYPERAGENT_CONTINUUM_ENABLED", "").lower() in {
++            "1",
++            "true",
++            "yes",
++            "on",
++        }:
++            openai_api_key = os.environ.get("HYPERAGENT_CONTINUUM_API_KEY",
++                                            "EMPTY")
++            openai_api_base = os.environ.get(
++                "HYPERAGENT_CONTINUUM_BASE_URL",
++                "http://127.0.0.1:8000/v1",
++            )
++            self.config["model"] = os.environ.get(
++                "HYPERAGENT_CONTINUUM_MODEL",
++                self.config["model"],
++            )
++        else:
++            openai_api_key = os.environ["TOGETHER_API_KEY"]
++            openai_api_base = "https://api.together.xyz"
+         # openai_api_base = "http://localhost:8004/v1"
+         # openai_api_key="token-abc123"
+ 
+diff --git a/src/hyperagent/continuum.py b/src/hyperagent/continuum.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d7f26cab73093882ab4c7b41637a3cc0d28e9418
+--- /dev/null
++++ b/src/hyperagent/continuum.py
+@@ -0,0 +1,318 @@
++"""vLLM-Continuum integration helpers for live HyperAgent runs.
++
++HyperAgent's main SWE-bench path uses AutoGen agents, and AutoGen owns the
++OpenAI-compatible client calls. This module installs a small OpenAI SDK hook
++that adds Continuum scheduling metadata to every chat completion request and
++records per-request metrics from the OpenAI-compatible response usage.
++"""
++
++from __future__ import annotations
++
++import atexit
++import json
++import os
++import time
++from pathlib import Path
++from threading import Lock
++from typing import Any
++
++_LOCK = Lock()
++_ORIGINAL_CREATE = None
++_ORIGINAL_ASYNC_CREATE = None
++_PATCHED = False
++_REQUEST_COUNTER = 0
++_JOB_ID: str | None = None
++_METRICS_PATH: Path | None = None
++_RECORDS: list[dict[str, Any]] = []
++
++
++def continuum_enabled() -> bool:
++    return os.environ.get("HYPERAGENT_CONTINUUM_ENABLED", "").lower() in {
++        "1",
++        "true",
++        "yes",
++        "on",
++    }
++
++
++def build_continuum_llm_configs(
++    *,
++    model: str,
++    base_url: str,
++    api_key: str = "EMPTY",
++) -> dict[str, Any]:
++    """Build one OpenAI-compatible config list for all HyperAgent roles."""
++    common = {
++        "model": model,
++        "api_key": api_key,
++        "base_url": base_url,
++        "api_type": "openai",
++        "price": [0.0, 0.0],
++    }
++    return {
++        "name": "vllm-continuum",
++        "nav": [{**common, "stop_sequences": ["\nObservation:"]}],
++        "edit": [{**common, "stop_sequences": ["\nObservation:"]}],
++        "exec": [{**common, "stop_sequences": ["\nObservation:"]}],
++        "plan": [{**common}],
++        "type": "patch",
++    }
++
++
++def configure_continuum_tracking(
++    *,
++    job_id: str,
++    metrics_path: str | Path | None = None,
++) -> None:
++    """Set the active Continuum job id and metrics output path."""
++    global _JOB_ID, _METRICS_PATH, _REQUEST_COUNTER, _RECORDS
++
++    with _LOCK:
++        _JOB_ID = job_id
++        if metrics_path is None:
++            metrics_dir = Path(
++                os.environ.get(
++                    "HYPERAGENT_CONTINUUM_METRICS_DIR",
++                    "results/hyperagent_continuum_metrics",
++                )
++            )
++            _METRICS_PATH = metrics_dir / f"{job_id}.metrics.json"
++        else:
++            _METRICS_PATH = Path(metrics_path)
++        _REQUEST_COUNTER = 0
++        _RECORDS = []
++
++
++def enable_continuum_from_env(
++    *,
++    default_job_id: str | None = None,
++    metrics_path: str | Path | None = None,
++) -> None:
++    """Enable request metadata/metrics if HYPERAGENT_CONTINUUM_ENABLED is set."""
++    if not continuum_enabled():
++        return
++
++    job_id = (
++        os.environ.get("HYPERAGENT_CONTINUUM_JOB_ID")
++        or default_job_id
++        or f"hyperagent-{int(time.time())}"
++    )
++    configure_continuum_tracking(job_id=job_id, metrics_path=metrics_path)
++    patch_openai_chat_completions()
++
++
++def _infer_agent_name(messages: Any) -> str:
++    if not isinstance(messages, list):
++        return "unknown"
++
++    text_parts: list[str] = []
++    for message in messages[:3]:
++        if not isinstance(message, dict):
++            continue
++        role = str(message.get("role", ""))
++        content = str(message.get("content", ""))
++        if role == "system":
++            text_parts.append(content[:1000])
++    joined = "\n".join(text_parts).lower()
++
++    if "navigator" in joined:
++        return "Navigator"
++    if "editor" in joined or "code editor" in joined:
++        return "Editor"
++    if "executor" in joined:
++        return "Executor"
++    if "planner" in joined:
++        return "Planner"
++    return "unknown"
++
++
++def _usage_value(usage: Any, key: str) -> int | None:
++    if usage is None:
++        return None
++    value = getattr(usage, key, None)
++    if value is None and isinstance(usage, dict):
++        value = usage.get(key)
++    if value is None:
++        return None
++    try:
++        return int(value)
++    except (TypeError, ValueError):
++        return None
++
++
++def _cached_prompt_tokens(usage: Any) -> int | None:
++    if usage is None:
++        return None
++    details = getattr(usage, "prompt_tokens_details", None)
++    if details is None and isinstance(usage, dict):
++        details = usage.get("prompt_tokens_details")
++    if details is None:
++        return None
++    value = getattr(details, "cached_tokens", None)
++    if value is None and isinstance(details, dict):
++        value = details.get("cached_tokens")
++    if value is None:
++        return None
++    try:
++        return int(value)
++    except (TypeError, ValueError):
++        return None
++
++
++def _write_metrics() -> None:
++    with _LOCK:
++        if _METRICS_PATH is None:
++            return
++        path = _METRICS_PATH
++        records = list(_RECORDS)
++        job_id = _JOB_ID
++
++    path.parent.mkdir(parents=True, exist_ok=True)
++    prompt_total = sum(r.get("prompt_tokens") or 0 for r in records)
++    completion_total = sum(r.get("completion_tokens") or 0 for r in records)
++    cached_total = sum(r.get("cached_prompt_tokens") or 0 for r in records)
++    new_prefill_total = sum(r.get("new_prefill_tokens") or 0 for r in records)
++    latency_total = sum(r.get("request_latency_s") or 0.0 for r in records)
++    payload = {
++        "job_id": job_id,
++        "num_requests": len(records),
++        "gpu_seconds_per_job": latency_total,
++        "total_prompt_tokens": prompt_total,
++        "total_completion_tokens": completion_total,
++        "total_cached_prompt_tokens": cached_total,
++        "total_new_prefill_tokens": new_prefill_total,
++        "prefill_reuse_ratio": (
++            cached_total / prompt_total if prompt_total > 0 else 0.0
++        ),
++        "records": records,
++    }
++    path.write_text(json.dumps(payload, indent=2))
++
++
++def _record_response(
++    *,
++    request_index: int,
++    model: str | None,
++    agent: str,
++    start_time: float,
++    end_time: float,
++    response: Any,
++    extra_body: dict[str, Any],
++) -> None:
++    usage = getattr(response, "usage", None)
++    prompt_tokens = _usage_value(usage, "prompt_tokens")
++    completion_tokens = _usage_value(usage, "completion_tokens")
++    total_tokens = _usage_value(usage, "total_tokens")
++    cached_tokens = _cached_prompt_tokens(usage)
++    new_prefill_tokens = None
++    if prompt_tokens is not None:
++        new_prefill_tokens = max(0, prompt_tokens - (cached_tokens or 0))
++
++    record = {
++        "request_index": request_index,
++        "job_id": extra_body.get("job_id"),
++        "agent": agent,
++        "model": model,
++        "request_start_time": start_time,
++        "request_end_time": end_time,
++        "request_latency_s": end_time - start_time,
++        "prompt_tokens": prompt_tokens,
++        "completion_tokens": completion_tokens,
++        "total_tokens": total_tokens,
++        "cached_prompt_tokens": cached_tokens,
++        "new_prefill_tokens": new_prefill_tokens,
++        "continuum_extra_body": extra_body,
++    }
++    with _LOCK:
++        _RECORDS.append(record)
++    _write_metrics()
++
++
++def _next_request_index() -> int:
++    global _REQUEST_COUNTER
++    with _LOCK:
++        _REQUEST_COUNTER += 1
++        return _REQUEST_COUNTER
++
++
++def _active_job_id() -> str:
++    if _JOB_ID is not None:
++        return _JOB_ID
++    return os.environ.get("HYPERAGENT_CONTINUUM_JOB_ID", "hyperagent-job")
++
++
++def _merge_continuum_extra_body(kwargs: dict[str, Any]) -> dict[str, Any]:
++    extra_body = dict(kwargs.get("extra_body") or {})
++    extra_body.setdefault("job_id", _active_job_id())
++    # In live HyperAgent we do not know before generation whether the current
++    # request will produce the final answer. The final extra pin expires by TTL
++    # and does not affect serial single-job JCT.
++    extra_body.setdefault("is_last_step", False)
++    kwargs["extra_body"] = extra_body
++    return extra_body
++
++
++def patch_openai_chat_completions() -> None:
++    """Patch OpenAI SDK chat completions to add Continuum metadata."""
++    global _ORIGINAL_CREATE, _ORIGINAL_ASYNC_CREATE, _PATCHED
++    if _PATCHED:
++        return
++
++    from openai.resources.chat.completions import Completions
++
++    _ORIGINAL_CREATE = Completions.create
++
++    def create_with_continuum(self, *args: Any, **kwargs: Any) -> Any:
++        request_index = _next_request_index()
++        model = kwargs.get("model")
++        agent = _infer_agent_name(kwargs.get("messages"))
++        extra_body = _merge_continuum_extra_body(kwargs)
++        start_time = time.time()
++        response = _ORIGINAL_CREATE(self, *args, **kwargs)
++        end_time = time.time()
++        _record_response(
++            request_index=request_index,
++            model=model,
++            agent=agent,
++            start_time=start_time,
++            end_time=end_time,
++            response=response,
++            extra_body=extra_body,
++        )
++        return response
++
++    Completions.create = create_with_continuum
++
++    try:
++        from openai.resources.chat.completions import AsyncCompletions
++
++        _ORIGINAL_ASYNC_CREATE = AsyncCompletions.create
++
++        async def async_create_with_continuum(
++            self, *args: Any, **kwargs: Any
++        ) -> Any:
++            request_index = _next_request_index()
++            model = kwargs.get("model")
++            agent = _infer_agent_name(kwargs.get("messages"))
++            extra_body = _merge_continuum_extra_body(kwargs)
++            start_time = time.time()
++            response = await _ORIGINAL_ASYNC_CREATE(self, *args, **kwargs)
++            end_time = time.time()
++            _record_response(
++                request_index=request_index,
++                model=model,
++                agent=agent,
++                start_time=start_time,
++                end_time=end_time,
++                response=response,
++                extra_body=extra_body,
++            )
++            return response
++
++        AsyncCompletions.create = async_create_with_continuum
++    except Exception:
++        # HyperAgent's current path is synchronous; async support is best-effort.
++        pass
++
++    atexit.register(_write_metrics)
++    _PATCHED = True
+diff --git a/src/hyperagent/pilot.py b/src/hyperagent/pilot.py
+index d747f3fd336fa2654b9d8315bbd0fdb32408718f..65f59868867560aeb81b97c2c8da07aa752b705d 100755
+--- a/src/hyperagent/pilot.py
++++ b/src/hyperagent/pilot.py
+@@ -4,6 +4,7 @@ from typing import Optional
+ from autogen import UserProxyAgent
+ from hyperagent.utils import clone_repo, check_local_or_remote, setup_logger
+ from hyperagent.agents.plan_seeking import load_agent_navigator, load_agent_editor, load_agent_executor, load_summarizer, load_agent_planner, load_manager
++from hyperagent.continuum import enable_continuum_from_env
+ from hyperagent.prompts.navigator import system_nav
+ from hyperagent.prompts.editor import system_edit
+ from hyperagent.prompts.executor import system_exec
+@@ -26,7 +27,14 @@ def Setup(
+     index_path: Optional[str] = "data/indexes",
+     llm_configs: Optional[dict] = None,
+     image_name: Optional[str] = DEFAULT_IMAGE_NAME,
++    continuum_job_id: Optional[str] = None,
++    continuum_metrics_path: Optional[str] = None,
+ ):
++    enable_continuum_from_env(
++        default_job_id=continuum_job_id,
++        metrics_path=continuum_metrics_path,
++    )
++
+     if not os.path.exists(DEFAULT_PATCHES_DIR):
+         os.makedirs(DEFAULT_PATCHES_DIR)
+     
+@@ -102,7 +110,9 @@ class HyperAgent:
+         save_trajectories_path=DEFAULT_TRAJECTORIES_PATH,
+         llm_configs = DEFAULT_LLM_CONFIGS,
+         verbose = DEFAULT_VERBOSE_LEVEL,
+-        image_name = DEFAULT_IMAGE_NAME
++        image_name = DEFAULT_IMAGE_NAME,
++        continuum_job_id: Optional[str] = None,
++        continuum_metrics_path: Optional[str] = None,
+     ):
+         self.repo_path = repo_path
+         self.language = language
+@@ -113,7 +123,9 @@ class HyperAgent:
+             clone_dir=clone_dir,
+             save_trajectories_path=save_trajectories_path,
+             llm_configs=llm_configs,
+-            image_name=image_name
++            image_name=image_name,
++            continuum_job_id=continuum_job_id,
++            continuum_metrics_path=continuum_metrics_path,
+         )
+         self.repo_dir = repo_dir
+         self.verbose = verbose

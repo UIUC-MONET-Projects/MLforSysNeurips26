@@ -1,0 +1,16 @@
+# agentic_continuum: hyperagent-replay package (install with: pip install -e agentic_continuum/hyperagent-replay)
+#
+# Python: >=3.10,<3.13 (hyperagent-replay/pyproject.toml); its README recommends 3.11.
+openai>=1.30.0   # the package's only declared runtime dependency (pyproject.toml)
+#
+# Optional, unpinned. Only derive_slos_and_resource_groups.py uses these, via --tokenizer tiktoken|hf:
+# tiktoken
+# transformers
+#
+# The analysis commands (ha-trace-analyze-reuse, ha-trace-eval, ha-trace-slo-report, ...) use only the
+# Python standard library. analyze_reuse.py writes its SVG plots without matplotlib.
+#
+# The serving side is a separate GPU environment and is not installed from this file:
+#   vllm: replays-two/vllm.log records vLLM 0.18.1 serving Qwen/Qwen2.5-Coder-14B-Instruct. That log covers
+#         only the 2026-04-08 baseline runs (astropy-12907, astropy-14365). No version is recorded for the other runs.
+#   The hyperagent-replay README gives the NCSA Delta install: UV_TORCH_BACKEND=cu128 uv pip install vllm (unpinned).

@@ -1,0 +1,32 @@
+# Python / Jupyter
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv*/
+venv/
+.ipynb_checkpoints/
+
+# OS / editor / local matplotlib cache
+.DS_Store
+.vscode/
+.idea/
+.mplconfig/
+
+# Env files (never commit credentials)
+.env
+.env.*
+
+# Upstream checkouts fetched and patched per patches/README.md (not part of this artifact)
+/third_party/
+/pretty-plots/
+/conversational_qlm/QLM/
+
+# Public datasets and traces (download instructions in the READMEs)
+ShareGPT_V3_unfiltered_cleaned_split.json
+/agentic_continuum/hyperagent-replay/trajectories/
+/agentic_continuum/hyperagent-replay/extracted/
+
+# Re-run outputs (keep the shipped paper data unchanged)
+/conversational_qlm/results/rerun*/

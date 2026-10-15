@@ -1,0 +1,100 @@
+diff --git a/pyproject.toml b/pyproject.toml
+index 416423abcad88d0c9866ea8e91579ae5eb074287..d659c9d4d2eb6f6b2600bd95f952e4661564d040 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -46,7 +46,11 @@ vllm = "vllm.entrypoints.cli.main:main"
+ lora_filesystem_resolver = "vllm.plugins.lora_resolvers.filesystem_resolver:register_filesystem_resolver"
+ 
+ [tool.setuptools_scm]
+-# no extra settings needed, presence enables setuptools-scm
++# Allow editable installs from a subdirectory of a git repo.
++# On clusters (e.g. Delta) MONET is a git repo at the root, and `vllm-continuum/`
++# is vendored as a plain folder. Without this, setuptools-scm fails to find a
++# version when installing from `vllm-continuum/`.
++search_parent_directories = true
+ 
+ [tool.setuptools.packages.find]
+ where = ["."]
+diff --git a/setup.py b/setup.py
+index 67f65d9b9f5665923e75e83707debaaa5bae9def..b3e694f543d83363582c5dbd26d0fc59c892d143 100644
+--- a/setup.py
++++ b/setup.py
+@@ -494,7 +494,14 @@ def get_gaudi_sw_version():
+ 
+ 
+ def get_vllm_version() -> str:
+-    version = get_version(write_to="vllm/_version.py")
++    # Allow building/installing from a vendored subdirectory inside a larger
++    # repository (e.g. MONET). In those cases, setuptools-scm can fail to infer
++    # the correct VCS root unless we anchor version detection to this file.
++    version = get_version(
++        write_to="vllm/_version.py",
++        relative_to=__file__,
++        root=str(ROOT_DIR),
++    )
+     sep = "+" if "+" not in version else "."  # dev versions might contain +
+ 
+     if _no_device():
+diff --git a/vllm/v1/core/estimate_with_func.py b/vllm/v1/core/estimate_with_func.py
+index af13868a3103beb98e8cd3827b31fe14d7da5854..eda8f4006a40c744020a2ad31ccff42eba4a11a9 100644
+--- a/vllm/v1/core/estimate_with_func.py
++++ b/vllm/v1/core/estimate_with_func.py
+@@ -79,12 +79,25 @@ class ToolCallParser:
+         Returns:
+             The function call name (e.g., "ls", "cd", "git"), or None if not found
+         """
+-        # Same regex pattern as mini-swe-agent: r"```bash\s*\n(.*?)\n```"
+-        actions = re.findall(r"```bash\s*\n(.*?)\n```", text, re.DOTALL)
+-
+-        if len(actions) == 1:
+-            bash_action = actions[0].strip()
+-            # Extract the first word (command) from the action
++        # HyperAgent commonly emits Python-style tool calls such as
++        # `open_file._run(...)` inside fenced code blocks. Preserve the
++        # original mini-swe-agent bash behavior, but check these tool-call
++        # signatures first so Continuum can pin KV across live HyperAgent
++        # tool gaps.
++        actions = re.findall(r"```(?:python|bash)?\s*\n(.*?)\n```",
++                             text,
++                             re.DOTALL)
++
++        for action in actions:
++            tool_match = re.search(r"\b([A-Za-z_]\w*)\._run\s*\(",
++                                   action)
++            if tool_match:
++                return tool_match.group(1)
++
++        bash_actions = re.findall(r"```bash\s*\n(.*?)\n```", text,
++                                  re.DOTALL)
++        if len(bash_actions) == 1:
++            bash_action = bash_actions[0].strip()
+             words = bash_action.split()
+             if words:
+                 return words[0]
+@@ -177,7 +190,13 @@ class ToolCallEstimator:
+     def request_finished(self, request: Request) -> None:
+         logger.info(f"Request job id finishing: {request.job_id}, time is {time.time()}")
+ 
+-        # Detokenize output and parse function call
++        # If the client supplied `this_func_call` in the request (e.g. the
++        # hyperagent-replay driver sends the recorded tool signature as
++        # scheduling metadata), keep that value: the built-in parser below
++        # only recognizes ```bash fenced commands, which miss most
++        # multi-agent traces that use Python-style tool invocations.
++        client_provided_func_call = getattr(request, "this_func_call", None)
++
+         this_func_call = None
+         if self.tokenizer is not None and len(request.output_token_ids) > 0:
+             try:
+@@ -197,7 +216,10 @@ class ToolCallEstimator:
+             except Exception as e:
+                 logger.warning(f"Error detokenizing/parsing output for request {request.request_id}: {e}")
+ 
+-        request.this_func_call = this_func_call
++        if client_provided_func_call is not None:
++            request.this_func_call = client_provided_func_call
++        else:
++            request.this_func_call = this_func_call
+         self.job_to_history[request.job_id].append({
+             "departure_time": time.time(),
+             "func_call": request.this_func_call

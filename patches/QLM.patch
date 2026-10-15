@@ -1,0 +1,1085 @@
+diff --git a/benchmarks/lp_smoke_test.py b/benchmarks/lp_smoke_test.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..022b75b14c1a5a4e901337abf44a6fa6d407a017
+--- /dev/null
++++ b/benchmarks/lp_smoke_test.py
+@@ -0,0 +1,43 @@
++import time
++
++from qlm.queue.group import Group
++from qlm.queue.request import Request
++from qlm.queue.virtual_queue import VirtualQueue
++from qlm.scheduler.scheduler import Scheduler
++
++
++def make_group(model: str, slo: int, num_requests: int) -> Group:
++    group = Group(model=model, slo=slo)
++    now = time.time()
++    for idx in range(num_requests):
++        group.add_request(
++            Request(
++                prompt=f"request-{idx}",
++                model=model,
++                slo=slo,
++                insertion_time=now,
++            )
++        )
++    return group
++
++
++def main() -> None:
++    print("Running LP scheduler smoke test with Gurobi")
++    scheduler = Scheduler(policy="lp")
++
++    vq = VirtualQueue()
++    vq.add_group(make_group("unsloth/Llama-3.2-1B-Instruct", slo=2000, num_requests=5))
++    vq.add_group(make_group("unsloth/Llama-3.2-1B-Instruct", slo=5000, num_requests=3))
++    vq.add_group(make_group("unsloth/Llama-3.2-1B-Instruct", slo=4000, num_requests=4))
++
++    reordered = scheduler.reorder([vq])
++    total_groups = sum(len(queue.groups) for queue in reordered)
++
++    if total_groups != 3:
++        raise RuntimeError(f"Expected 3 groups after LP reorder, found {total_groups}")
++
++    print("LP smoke test succeeded.")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/benchmarks/workload_driver.py b/benchmarks/workload_driver.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4ce1539f6f66337c3d7df9aa1f2428b5ffbf9b75
+--- /dev/null
++++ b/benchmarks/workload_driver.py
+@@ -0,0 +1,260 @@
++#!/usr/bin/env python3
++"""
++QLM Workload Driver: run workload-sensitivity experiments with configurable
++arrival rate, burstiness, concurrent users, and datasets (ShareGPT + Hugging Face).
++
++Usage:
++  export QLMPROJDIR=/path/to/QLM
++  # With vLLM running separately on port 8000 (optional: use --no-start-vllm and a dummy endpoint)
++  python benchmarks/workload_driver.py --dataset sharegpt --duration 60 --arrival-rate 2 --output metrics.json
++
++  # Burstiness: send 5 requests every 2 seconds
++  python benchmarks/workload_driver.py --dataset sharegpt --duration 60 --burst-size 5 --burst-interval 2.0
++
++  # Multiple concurrent users
++  python benchmarks/workload_driver.py --dataset lmsys/lmsys-chat-1m --num-users 4 --arrival-rate 1 --max-samples 500
++"""
++
++import argparse
++import asyncio
++import os
++import sys
++import time
++
++# Add project root for imports when run from repo
++_QLM_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++if _QLM_ROOT not in sys.path:
++    sys.path.insert(0, _QLM_ROOT)
++
++from qlm.queue.queue import Queue
++from qlm.endpoints.endpoint import Endpoint
++from qlm.workload.datasets import get_prompts_from_dataset, load_sharegpt, load_hf_dataset, SUPPORTED_DATASETS
++from qlm.workload.metrics import ExperimentMetrics
++
++
++def _make_dummy_endpoint(model: str, address: str, port: int):
++    """Minimal endpoint that does not start vLLM (for when vLLM is already running)."""
++    class DummyEndpoint:
++        def __init__(self):
++            self.model = model
++            self.address = address
++            self.port = port
++        def model_swap(self, new_model: str):
++            self.model = new_model
++    return DummyEndpoint()
++
++
++async def _metrics_sampler(
++    queue: Queue,
++    metrics: ExperimentMetrics,
++    sample_interval_sec: float,
++    stop_event: asyncio.Event,
++):
++    """Periodically record queue length and backpressure (GPU proxy)."""
++    while not stop_event.is_set():
++        try:
++            metrics.record_queue_length(queue.get_queue_length())
++            for w in queue.workers:
++                try:
++                    bp = await asyncio.to_thread(w.get_backpressure)
++                    metrics.record_backpressure(bp)
++                    break
++                except Exception:
++                    pass
++        except asyncio.CancelledError:
++            break
++        await asyncio.sleep(sample_interval_sec)
++
++
++async def _user_task(
++    queue: Queue,
++    prompts: list,
++    arrival_rate: float,
++    burst_size: int,
++    burst_interval: float,
++    model: str,
++    slo: float,
++    user_id: int,
++    stop_event: asyncio.Event,
++):
++    """One simulated user: push requests according to arrival_rate or burst pattern."""
++    idx = 0
++    n = len(prompts)
++    if n == 0:
++        return
++    if burst_size > 1 and burst_interval > 0:
++        # Bursty: send burst_size requests every burst_interval seconds
++        while not stop_event.is_set():
++            for _ in range(burst_size):
++                prompt = prompts[idx % n].get("prompt") or prompts[idx % n]
++                if isinstance(prompt, dict):
++                    prompt = prompt.get("prompt", "")
++                queue.push(prompt=prompt, model=model, slo=slo, insertion_time=time.time())
++                idx += 1
++            await asyncio.sleep(burst_interval)
++    else:
++        # Uniform: 1 request every 1/arrival_rate seconds
++        interval = 1.0 / arrival_rate if arrival_rate > 0 else 1.0
++        while not stop_event.is_set():
++            prompt = prompts[idx % n].get("prompt") or prompts[idx % n]
++            if isinstance(prompt, dict):
++                prompt = prompt.get("prompt", "")
++            queue.push(prompt=prompt, model=model, slo=slo, insertion_time=time.time())
++            idx += 1
++            await asyncio.sleep(interval)
++
++
++async def run_experiment(
++    dataset_name: str,
++    max_samples: int,
++    duration_sec: float,
++    arrival_rate: float,
++    burst_size: int,
++    burst_interval: float,
++    num_concurrent_users: int,
++    model: str,
++    slo: float,
++    address: str,
++    port: int,
++    start_vllm: bool,
++    output_path: str,
++    project_dir: str,
++    prompt_length_bucket: str,
++):
++    project_dir = project_dir or os.environ.get("QLMPROJDIR", _QLM_ROOT)
++    os.environ["QLMPROJDIR"] = project_dir
++
++    # Load prompts
++    print(f"Loading dataset: {dataset_name} (max_samples={max_samples}, prompt_length_bucket={prompt_length_bucket or 'all'})")
++    try:
++        prompts = get_prompts_from_dataset(
++            dataset_name,
++            project_dir=project_dir,
++            max_samples=max_samples,
++            prompt_length_bucket=prompt_length_bucket or None,
++        )
++    except FileNotFoundError as e:
++        print(f"Dataset error: {e}")
++        return 1
++    except Exception as e:
++        print(f"Failed to load dataset: {e}")
++        return 1
++    if not prompts:
++        print("No prompts loaded. Check dataset path or filters.")
++        return 1
++    print(f"Loaded {len(prompts)} prompts.")
++
++    # Endpoint and queue
++    if start_vllm:
++        endpoint = Endpoint(model=model, address=address, port=port)
++    else:
++        endpoint = _make_dummy_endpoint(model, address, port)
++    q = Queue()
++    q.register_worker(address, port, endpoint)
++
++    # Metrics and dispatch callback
++    metrics = ExperimentMetrics()
++    metrics.start()
++
++    def on_dispatch(request, dispatch_time: float):
++        metrics.record_scheduling_delay(str(request.request_id), request.insertion_time, dispatch_time)
++
++    q.set_on_dispatch_callback(on_dispatch)
++
++    # Run queue loop and metrics sampler in background
++    stop_event = asyncio.Event()
++    queue_task = asyncio.create_task(q.run_queue())
++    sampler_task = asyncio.create_task(
++        _metrics_sampler(q, metrics, 0.25, stop_event)
++    )
++
++    # Run N user tasks
++    user_tasks = [
++        asyncio.create_task(
++            _user_task(
++                q, prompts, arrival_rate, burst_size, burst_interval,
++                model, slo, i, stop_event,
++            )
++        )
++        for i in range(num_concurrent_users)
++    ]
++
++    # Stop after duration
++    await asyncio.sleep(duration_sec)
++    stop_event.set()
++    sampler_task.cancel()
++    try:
++        await sampler_task
++    except asyncio.CancelledError:
++        pass
++    await asyncio.gather(*user_tasks)
++    queue_task.cancel()
++    try:
++        await queue_task
++    except asyncio.CancelledError:
++        pass
++
++    metrics.stop()
++    metrics.save_json(output_path)
++    print("Experiment finished.")
++    return 0
++
++
++def main():
++    ap = argparse.ArgumentParser(description="QLM workload sensitivity experiments")
++    ap.add_argument("--dataset", type=str, default="sharegpt",
++                    help="Dataset: sharegpt or a Hugging Face name (e.g. lmsys/lmsys-chat-1m)")
++    ap.add_argument("--max-samples", type=int, default=1000,
++                    help="Max prompts to load from dataset (default 1000)")
++    ap.add_argument("--duration", type=float, default=60.0,
++                    help="Experiment duration in seconds (default 60)")
++    ap.add_argument("--arrival-rate", type=float, default=2.0,
++                    help="Requests per second per user when not using burst (default 2)")
++    ap.add_argument("--burst-size", type=int, default=0,
++                    help="If > 1, send this many requests per burst (burstiness)")
++    ap.add_argument("--burst-interval", type=float, default=2.0,
++                    help="Seconds between bursts when burst-size > 1 (default 2)")
++    ap.add_argument("--num-users", type=int, default=1,
++                    help="Number of concurrent simulated users (default 1)")
++    ap.add_argument("--model", type=str, default="unsloth/Llama-3.2-1B-Instruct",
++                    help="Model name for requests")
++    ap.add_argument("--slo", type=float, default=1000.0,
++                    help="SLO in seconds (default 1000)")
++    ap.add_argument("--address", type=str, default="localhost",
++                    help="Worker address (default localhost)")
++    ap.add_argument("--port", type=int, default=8000,
++                    help="Worker port (default 8000)")
++    ap.add_argument("--no-start-vllm", action="store_true",
++                    help="Do not start vLLM; assume it is already running")
++    ap.add_argument("--output", type=str, default="workload_metrics.json",
++                    help="Output path for metrics JSON (default workload_metrics.json)")
++    ap.add_argument("--project-dir", type=str, default=None,
++                    help="QLM project dir (default QLMPROJDIR or repo root)")
++    ap.add_argument("--prompt-length", type=str, default=None,
++                    choices=["short", "medium", "long"],
++                    help="Filter prompts by length bucket: short (<=200), medium (200-1000), long (>1000)")
++    args = ap.parse_args()
++
++    return asyncio.run(
++        run_experiment(
++            dataset_name=args.dataset,
++            max_samples=args.max_samples,
++            duration_sec=args.duration,
++            arrival_rate=args.arrival_rate,
++            burst_size=args.burst_size or 1,
++            burst_interval=args.burst_interval,
++            num_concurrent_users=args.num_users,
++            model=args.model,
++            slo=args.slo,
++            address=args.address,
++            port=args.port,
++            start_vllm=not args.no_start_vllm,
++            output_path=args.output,
++            project_dir=args.project_dir,
++            prompt_length_bucket=args.prompt_length,
++        )
++    )
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/docs/WORKLOAD_SENSITIVITY_EXPERIMENTS.md b/docs/WORKLOAD_SENSITIVITY_EXPERIMENTS.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..dcbfa8b24cf9a56a058adf53cad29f41096b8d58
+--- /dev/null
++++ b/docs/WORKLOAD_SENSITIVITY_EXPERIMENTS.md
+@@ -0,0 +1,111 @@
++# QLM Workload Sensitivity Experiments
++
++**Goal:** Understand how different workload patterns affect performance.
++
++---
++
++## 1. Parameters to vary
++
++| Parameter | What it controls | How to vary in QLM |
++|-----------|------------------|--------------------|
++| **Request arrival rate** | How many requests per second are pushed | In the experiment driver: control `push()` rate (e.g. Poisson/inter-arrival times). |
++| **Prompt length distribution** | Short vs long prompts | Sample prompts from datasets with different length distributions, or truncate/pad. |
++| **Output token distribution** | Implicit in request “size” | QLM uses `workload_tokens` in config; can vary per-request or use datasets with different reply lengths. |
++| **Burstiness** | Spiky vs smooth arrival | In the driver: send requests in bursts (e.g. N at once every T seconds) vs uniform spacing. |
++| **Number of concurrent users** | Multiple logical streams of requests | Simulate multiple “users” (e.g. separate async tasks) each pushing at different rates. |
++
++**Current QLM interface:** `Queue.push(prompt, model, slo, insertion_time)`. Experiments need a **workload driver** that generates sequences of `(prompt, model, slo, insertion_time)` with the above distributions.
++
++---
++
++## 2. Metrics to collect
++
++| Metric | Meaning | How to get it in QLM |
++|--------|---------|----------------------|
++| **Queue length** | Number of requests/groups waiting | Instrument `VirtualQueueEngine` / `VirtualQueue`: record `sum(len(vq.groups))` or total requests across groups over time. |
++| **GPU utilization** | How busy the vLLM worker is | From vLLM `/metrics` (worker already has `get_backpressure()`); add scraping of GPU util (e.g. `nvidia-smi` or vLLM metrics). |
++| **Scheduling delay** | Time from request insert to start of execution | Record `insertion_time` when pushing; when request is popped and sent to worker, record delay = `now - insertion_time`. Log per request. |
++
++**Implementation note:** QLM does not yet log these metrics to a file. Add a small **metrics collector** (e.g. callback or wrapper around `add_request` / `pop_request` / worker calls) that writes time-series data (timestamp, queue_length, gpu_util, scheduling_delay) for later analysis.
++
++---
++
++## 3. Datasets for workloads
++
++### ShareGPT (already referenced in QLM)
++
++- **Source:** [Hugging Face: anon8231489123/ShareGPT_Vicuna_unfiltered](https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered) — file `ShareGPT_V3_unfiltered_cleaned_split.json`.
++- **QLM data README:** `data/README.md` says:
++  ```bash
++  wget https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json
++  ```
++- **Usage in QLM:** `benchmarks/basic_test.py` already loads this JSON, filters conversations with ≥2 turns, and uses the first user message as the prompt. You can extend this to sample by prompt length, add SLO/length variation, and control arrival times.
++
++### Other Hugging Face datasets that can run on QLM
++
++These are text/conversation datasets you can use as **prompt** (and optionally output-length) sources. Download via `datasets` or direct URL and map to `(prompt, model, slo)` in your workload driver.
++
++| Dataset | HF path | Notes |
++|---------|---------|--------|
++| **LMSYS Chat 1M** | `lmsys/lmsys-chat-1m` | ~1M conversations; ~69.5 tokens/prompt, ~214.5 tokens/response; good for prompt/response length distribution. |
++| **WildChat** | `allenai/WildChat-4.8M` | Large conversation set; multiple models; useful for diverse prompt lengths and “user” behavior. |
++| **ShareGPT Vicuna** | `anon8231489123/ShareGPT_Vicuna_unfiltered` | Same as current ShareGPT; multiple splits available on HF. |
++| **OpenAssistant** | `OpenAssistant/oasst1` | Conversation-style; can extract first user message as prompt. |
++| **Multi-turn conversations** | `jackwarner/multi-turn-conversations` | Multi-turn; good for testing burstiness (multiple turns per “user”). |
++
++**Suggested approach:** Use **ShareGPT** as the first dataset (already in the repo’s instructions), then add **one or two** from Hugging Face (e.g. `lmsys/lmsys-chat-1m`, `allenai/WildChat-4.8M`) to vary prompt length and “user” patterns. Load with:
++
++```python
++from datasets import load_dataset
++ds = load_dataset("lmsys/lmsys-chat-1m", split="train", trust_remote_code=True)
++# Then map to prompts (e.g. first user message) and optionally token counts
++```
++
++---
++
++## 4. Implemented: workload driver and metrics
++
++- **Dataset loaders** (`qlm/workload/datasets.py`): ShareGPT (local JSON) and Hugging Face datasets (`lmsys/lmsys-chat-1m`, `allenai/WildChat-4.8M`, `OpenAssistant/oasst1`, `HuggingFaceH4/ultrachat_200k`). Prompt length buckets: `short`, `medium`, `long`.
++- **Metrics** (`qlm/workload/metrics.py`): `ExperimentMetrics` records queue length samples, scheduling delays, and backpressure (GPU proxy); saves JSON with summary stats.
++- **Workload driver** (`benchmarks/workload_driver.py`): CLI to run experiments with configurable arrival rate, burstiness (`--burst-size`, `--burst-interval`), `--num-users`, `--dataset`, `--duration`, `--prompt-length`. Writes metrics to a JSON file.
++
++### Quick start
++
++1. **Download ShareGPT** (if using `--dataset sharegpt`):
++   ```bash
++   cd QLM && wget https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json -O data/ShareGPT_V3_unfiltered_cleaned_split.json
++   ```
++2. **Set project dir** and run (vLLM must be running on port 8000, or use `--no-start-vllm` and start vLLM yourself):
++   ```bash
++   export QLMPROJDIR=/path/to/QLM
++   python benchmarks/workload_driver.py --dataset sharegpt --duration 60 --arrival-rate 2 --output metrics.json
++   ```
++3. **Burstiness**: e.g. 5 requests every 2 seconds:
++   ```bash
++   python benchmarks/workload_driver.py --dataset sharegpt --burst-size 5 --burst-interval 2.0 --duration 60 --output burst_metrics.json
++   ```
++4. **Multiple users + Hugging Face dataset**:
++   ```bash
++   python benchmarks/workload_driver.py --dataset lmsys/lmsys-chat-1m --num-users 4 --arrival-rate 1 --max-samples 500 --output hf_metrics.json
++   ```
++
++### Suggested next steps
++
++1. Run sweeps over arrival rate, burstiness, and number of users; record metrics for each run.
++2. Compare datasets (ShareGPT vs LMSYS vs WildChat) and prompt-length buckets.
++3. Plot queue length, backpressure (GPU proxy), and scheduling delay vs the varied parameters.
++
++
++diff access patterns hetereogoenous workloads on vllm
++diff req rate conccurrency prompt lenghts
++analyze the workload differences
++service engines
++
++GPT traces, mast traces, workload aware
++replaced with agentic workflow traces
++
++have 2 datasets... VLLM with QLM
++
++finish the experiments
++
++6-7 graphs for report
+\ No newline at end of file
+diff --git a/qlm/__init__.py b/qlm/__init__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/qlm/config.py b/qlm/config.py
+index 1d8a0db7d2848c8c69fd5fed55a17fd2c4961e35..fcc2e6b855ecba93b3aeef5e7e96e2e1bea710a9 100644
+--- a/qlm/config.py
++++ b/qlm/config.py
+@@ -1,12 +1,5 @@
+-from vllm import LLM, SamplingParams
+-from vllm.engine.arg_utils import AsyncEngineArgs
+-from vllm.engine.async_llm_engine import AsyncLLMEngine
+-from vllm.sampling_params import SamplingParams
+-from vllm.utils import random_uuid
+-import argparse
+ import yaml
+ import os
+-from time import perf_counter
+ 
+ 
+ class Config:
+diff --git a/qlm/config.yaml b/qlm/config.yaml
+index c77bd121d02f3c4b5b6c43abec491e8f337cd831..52a8e617148483c7c632b87dcc6604800f056e79 100644
+--- a/qlm/config.yaml
++++ b/qlm/config.yaml
+@@ -4,7 +4,7 @@ workload_tokens: 100
+ 
+ slo_granularity: 100
+ 
+-model_swap_time: 100
++model_swap_time: 10
+ 
+ token_throughput:
+   unsloth/Llama-3.2-1B-Instruct: 10000
+@@ -12,7 +12,7 @@ token_throughput:
+   meta-llama/Llama-3.1-8B-Instruct: 700
+ 
+ gurobi:
+-  access_id: NULL
+-  secret_key: NULL
++  access_id: REDACTED_GUROBI_WLS_ACCESS_ID
++  secret_key: REDACTED_GUROBI_WLS_SECRET_KEY
+   license: NULL
+ 
+diff --git a/qlm/endpoints/__init__.py b/qlm/endpoints/__init__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/qlm/queue/__init__.py b/qlm/queue/__init__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/qlm/queue/queue.py b/qlm/queue/queue.py
+index 5489c406b1476d391a1bca60325951b84711264e..2036f458ad2fd543b08b2f610fd0b0c5e32c7e28 100644
+--- a/qlm/queue/queue.py
++++ b/qlm/queue/queue.py
+@@ -1,4 +1,5 @@
+ import asyncio
++import time
+ from collections import deque
+ from qlm.config import Config
+ from qlm.queue.virtual_queue_engine import VirtualQueueEngine
+@@ -20,6 +21,15 @@ class Queue:
+         self.workers = []
+         self.config = Config()
+         self.vq_engine = VirtualQueueEngine()
++        self._on_dispatch_callback = None  # (request, dispatch_time) -> None, for metrics
++
++    def get_queue_length(self) -> int:
++        """Total number of requests waiting in the queue (for metrics)."""
++        return self.vq_engine.get_queue_length()
++
++    def set_on_dispatch_callback(self, callback) -> None:
++        """Set callback(request, dispatch_time) when a request is dispatched to a worker."""
++        self._on_dispatch_callback = callback
+ 
+     def register_worker(self, address, port, endpoint):
+         """
+@@ -55,18 +65,27 @@ class Queue:
+ 
+         while True:
+             self.vq_engine.reorder_vqs()
++            dispatched = False
+             for worker in self.workers:
+-                try:
+-                    backpressure = worker.get_backpressure()
+-                    has_request = self.vq_engine.has_request(worker)
++                # get_backpressure() makes a blocking HTTP call; run in a thread so we
++                # don't stall the event loop and starve other coroutines.
++                backpressure = await asyncio.to_thread(worker.get_backpressure)
++                has_request = self.vq_engine.has_request(worker)
+ 
+-                    if has_request and backpressure < self.config.max_batch_size:
+-                        request_to_serve = self.vq_engine.pop_request(worker)
+-                        await asyncio.to_thread(
+-                            worker.add_request,
+-                            request_to_serve.prompt,
+-                            request_to_serve.model,
+-                        )
++                if has_request and backpressure < self.config.max_batch_size:
++                    request_to_serve = self.vq_engine.pop_request(worker)
++                    dispatch_time = time.time()
++                    if self._on_dispatch_callback:
++                        self._on_dispatch_callback(request_to_serve, dispatch_time)
++                    await asyncio.to_thread(
++                        worker.add_request,
++                        request_to_serve.prompt,
++                        request_to_serve.model,
++                    )
++                    dispatched = True
+ 
+-                except asyncio.CancelledError as e:
+-                    print("handling cancelled error", e)
++            # If nothing was dispatched this iteration, yield to the event loop so
++            # _user_task coroutines can run and push prompts into the queue.
++            # Without this yield the loop spin-blocks and no prompts ever arrive.
++            if not dispatched:
++                await asyncio.sleep(0.01)
+diff --git a/qlm/queue/virtual_queue_engine.py b/qlm/queue/virtual_queue_engine.py
+index c7e56a0a67a2acf19b15873f02eb55c41979eac2..82f3da0e63070974e73e3606db387cb8357a2bc4 100644
+--- a/qlm/queue/virtual_queue_engine.py
++++ b/qlm/queue/virtual_queue_engine.py
+@@ -5,6 +5,7 @@ from qlm.queue.group import Group
+ from qlm.queue.request import Request
+ from qlm.scheduler.scheduler import Scheduler
+ import random
++import os
+ 
+ 
+ class VirtualQueueEngine:
+@@ -22,7 +23,8 @@ class VirtualQueueEngine:
+         self.group_to_vq = {}
+         self.vq_worker_bimap = bidict({})
+         self.model_slo_group_bimap = bidict({})
+-        self.scheduler = Scheduler()
++        scheduler_policy = os.environ.get("QLM_SCHEDULER_POLICY", "edf").lower()
++        self.scheduler = Scheduler(policy=scheduler_policy)
+ 
+     def add_worker(self, worker):
+         """
+@@ -33,6 +35,10 @@ class VirtualQueueEngine:
+         self.vqs.append(new_vq)
+         self.vq_worker_bimap[new_vq] = worker
+ 
++    def _group_in_any_vq(self, group) -> bool:
++        """Returns True if the group is currently registered in any virtual queue."""
++        return any(group in vq.groups for vq in self.vqs)
++
+     def add_request(self, request):
+         """
+         Adds a request to the virtual queue engine. If a group with the same model and slo exists, adds the request to
+@@ -43,6 +49,13 @@ class VirtualQueueEngine:
+             existing_group = self.model_slo_group_bimap[(request.model, request.slo)]
+             existing_group.add_request(request)
+             self.request_to_group[request] = existing_group
++            # The group is removed from its VQ when it becomes empty (see pop_request).
++            # If a new request arrives after that, we must re-insert it so the queue
++            # loop can see it again via has_request(). Without this, all requests after
++            # the first complete group cycle are silently dropped.
++            if not self._group_in_any_vq(existing_group):
++                vq_idx = random.choice(range(len(self.vqs)))
++                self.vqs[vq_idx].add_group(existing_group)
+         else:
+             new_group = Group(request.model, request.slo)
+             print("Adding new group with model and slo", request.model, request.slo)
+@@ -80,6 +93,17 @@ class VirtualQueueEngine:
+         vq = self.vq_worker_bimap.inv[worker]
+         return len(vq.groups) > 0
+ 
++    def get_queue_length(self) -> int:
++        """
++        Total number of requests currently in all virtual queues (waiting, not yet dispatched).
++        Used for workload experiment metrics.
++        """
++        total = 0
++        for vq in self.vqs:
++            for group in vq.groups:
++                total += len(group.requests)
++        return total
++
+     def reorder_vqs(self):
+         """
+         Reorders the virtual queues based on the scheduler. If the scheduler detects an SLO violation, reorders the virtual
+diff --git a/qlm/queue/worker.py b/qlm/queue/worker.py
+index 9fdb531e9d22695c280bd6fc3c1574e2612395d0..166b4b2e545789ee7924c73bdae9f6a4df8de490 100644
+--- a/qlm/queue/worker.py
++++ b/qlm/queue/worker.py
+@@ -16,7 +16,9 @@ class Worker:
+         :param address: The address of the worker.
+         :param port: The port of the worker.
+         """
+-        self.address = f"http://localhost:{port}"
++        # Use the configured address (important for remote hosts / Runpod).
++        # vLLM serves HTTP on this host:port.
++        self.address = f"http://{address}:{port}"
+         self.endpoint= endpoint
+         self.openai_api_base = f"{self.address}/v1"
+         self.openai_api_key = "EMPTY"
+@@ -54,6 +56,9 @@ class Worker:
+         for line in metrics.text.splitlines():
+             if line.startswith(metric_name):
+                 return float(line.split()[-1])
++        # Metric not found (vLLM metric names can vary by version).
++        # Returning 0 keeps the workload driver functional instead of deadlocking dispatch.
++        return 0.0
+ 
+     def get_backpressure(self):
+         """
+@@ -71,8 +76,9 @@ class Worker:
+ 
+             return backpressure
+         except Exception as e:
+-            # If the worker is not reachable, return infinite backpressure
+-            return INF
++            # If metrics are temporarily unavailable/parsing fails, don't deadlock dispatch.
++            # Treat as no backpressure and let vLLM apply natural backpressure (latency).
++            return 0.0
+ 
+     def __hash__(self):
+         return hash(self.worker_id)
+diff --git a/qlm/scheduler/__init__.py b/qlm/scheduler/__init__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/qlm/scheduler/scheduler.py b/qlm/scheduler/scheduler.py
+index 2b98c579e17cf06fb66828e6a40a1af1357970a9..f7cd216f12b8d83e08aedfc7d2fcbdd3433af59a 100644
+--- a/qlm/scheduler/scheduler.py
++++ b/qlm/scheduler/scheduler.py
+@@ -9,6 +9,7 @@ from gurobipy import LinExpr
+ from bidict import bidict
+ import time
+ from collections import deque
++from copy import deepcopy
+ 
+ 
+ class Scheduler:
+@@ -60,7 +61,7 @@ class Scheduler:
+                 curr_model = group.model
+ 
+                 if prev_model != None and prev_model != curr_model:
+-                    est_time += config.swap_time
++                    est_time += self.config.model_swap_time
+ 
+                 waiting_time = self.rwt_estimator.get_waiting_time(group)
+ 
+@@ -102,11 +103,16 @@ class Scheduler:
+         :return: The reordered list of virtual queues.
+         """
+ 
+-        options = {
+-            "WLSACCESSID": self.config.gurobi["access_id"],
+-            "WLSSECRET": self.config.gurobi["secret_key"],
+-            "LICENSEID": self.config.gurobi["license"],
+-        }
++        options = {}
++        access_id = self.config.gurobi.get("access_id")
++        secret_key = self.config.gurobi.get("secret_key") or self.config.gurobi.get("secret")
++        license_id = self.config.gurobi.get("license")
++        if access_id and secret_key and license_id:
++            options = {
++                "WLSACCESSID": access_id,
++                "WLSSECRET": secret_key,
++                "LICENSEID": int(license_id),
++            }
+ 
+         groups = []
+         slos = []
+@@ -117,17 +123,17 @@ class Scheduler:
+         last_model_idx = 0
+         last_group_idx = 0
+ 
+-        vqs_fail_case = vq.copy()
++        vqs_fail_case = deepcopy(vqs)
+ 
+         for vq in vqs:
+             while len(vq.groups) > 0:
+                 group = vq.groups.popleft()
+                 groups.append(self.rwt_estimator.get_waiting_time(group))
+-                group_idx_bidict[group] = last_group_idx
++                group_idx_bimap[group] = last_group_idx
+                 last_group_idx += 1
+                 slos.append(group.slo)
+-                if group.model in model_idx_bidict:
+-                    models.append(model_idx_bidict[group.model])
++                if group.model in model_idx_bimap:
++                    models.append(model_idx_bimap[group.model])
+                 else:
+                     model_idx_bimap[group.model] = last_model_idx
+                     models.append(last_model_idx)
+@@ -143,16 +149,17 @@ class Scheduler:
+             self.config.model_swap_time
+         )  # Time required to swap two models
+ 
+-        with gp.Env(params=options) as env, gp.Model(env=env) as model:
++        env_args = {"params": options} if options else {}
++        with gp.Env(**env_args) as env, gp.Model(env=env) as model:
+ 
+             # Model initialization
+             x = model.addVars(WORKERs, N, N, vtype=GRB.BINARY, name="x")
+-            completion_slot = model.addVars(WORKERs, N, vtype=GRB.INTEGER, name="ct")
++            completion_slot = model.addVars(WORKERs, N, vtype=GRB.CONTINUOUS, name="ct")
+             model_slot = model.addVars(WORKERs, N, vtype=GRB.INTEGER, name="model")
+-            transition_slot = model.addVars(WORKERs, N, vtype=GRB.INTEGER, name="trans")
+-            slo_slot = model.addVars(WORKERs, N, vtype=GRB.INTEGER, name="slo")
++            transition_slot = model.addVars(WORKERs, N, vtype=GRB.BINARY, name="trans")
++            slo_slot = model.addVars(WORKERs, N, vtype=GRB.CONTINUOUS, name="slo")
+             penalty_slot = model.addVars(
+-                WORKERs, N, vtype=GRB.INTEGER, name="penalty", lb=-100000
++                WORKERs, N, vtype=GRB.CONTINUOUS, name="penalty", lb=-100000
+             )
+ 
+             # Group assignment to GPU slot
+@@ -257,4 +264,4 @@ class Scheduler:
+             else:
+                 print("No optimal solution found for LP, reverting to EDF")
+                 vqs = vqs_fail_case
+-                self._reorder_edf(vqs)
++                return self._reorder_edf(vqs)
+diff --git a/qlm/workload/__init__.py b/qlm/workload/__init__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..83a29fe3d042f53d4bfbb3e86b50cf27c1d02c3c
+--- /dev/null
++++ b/qlm/workload/__init__.py
+@@ -0,0 +1,19 @@
++"""
++Workload utilities for QLM experiments: dataset loaders and metrics.
++"""
++
++from qlm.workload.datasets import (
++    load_sharegpt,
++    load_hf_dataset,
++    get_prompts_from_dataset,
++    SUPPORTED_DATASETS,
++)
++from qlm.workload.metrics import ExperimentMetrics
++
++__all__ = [
++    "load_sharegpt",
++    "load_hf_dataset",
++    "get_prompts_from_dataset",
++    "SUPPORTED_DATASETS",
++    "ExperimentMetrics",
++]
+diff --git a/qlm/workload/datasets.py b/qlm/workload/datasets.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a0514f64f35e0466751e38c7ef764582f977fde1
+--- /dev/null
++++ b/qlm/workload/datasets.py
+@@ -0,0 +1,197 @@
++"""
++Load prompt datasets for QLM workload experiments: ShareGPT (local) and Hugging Face.
++Each loader returns a list of dicts with at least "prompt" (str) and optional "prompt_length", "response_length".
++"""
++
++import json
++import os
++from typing import Any, Callable, List, Optional
++
++# Hugging Face datasets is optional at import; we use it only when loading HF datasets.
++try:
++    from datasets import load_dataset
++    _HF_AVAILABLE = True
++except ImportError:
++    _HF_AVAILABLE = False
++
++
++# Default path for ShareGPT relative to QLM project root (data/ or ../data from benchmarks).
++SHAREGPT_DEFAULT_PATH = "data/ShareGPT_V3_unfiltered_cleaned_split.json"
++
++# Map dataset name to (HF path, split, prompt extraction strategy).
++SUPPORTED_DATASETS = {
++    "sharegpt": None,  # local file
++    "lmsys/lmsys-chat-1m": ("lmsys/lmsys-chat-1m", "train", "lmsys"),
++    "allenai/WildChat-4.8M": ("allenai/WildChat-4.8M", "train", "wildchat"),
++    "OpenAssistant/oasst1": ("OpenAssistant/oasst1", "train", "oasst"),
++    "HuggingFaceH4/ultrachat_200k": ("HuggingFaceH4/ultrachat_200k", "train_sft", "ultrachat"),
++}
++
++
++def _sharegpt_path(project_dir: Optional[str] = None) -> str:
++    if project_dir:
++        return os.path.join(project_dir, "data", "ShareGPT_V3_unfiltered_cleaned_split.json")
++    return os.path.join(os.environ.get("QLMPROJDIR", "."), "data", "ShareGPT_V3_unfiltered_cleaned_split.json")
++
++
++def load_sharegpt(
++    path: Optional[str] = None,
++    project_dir: Optional[str] = None,
++    min_turns: int = 2,
++    max_samples: Optional[int] = None,
++) -> List[dict]:
++    """
++    Load ShareGPT from local JSON. Each item is {"prompt": str, "prompt_length": int (chars)}.
++    """
++    if path is None:
++        path = _sharegpt_path(project_dir)
++    if not os.path.isfile(path):
++        raise FileNotFoundError(
++            f"ShareGPT file not found: {path}. "
++            "Download with: wget https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json -O data/ShareGPT_V3_unfiltered_cleaned_split.json"
++        )
++    with open(path, encoding="utf-8") as f:
++        data = json.load(f)
++    out = []
++    for item in data:
++        conv = item.get("conversations") or []
++        if len(conv) < min_turns:
++            continue
++        # First user message as prompt (same as basic_test.py)
++        first_msg = conv[0].get("value") or ""
++        if not first_msg.strip():
++            continue
++        out.append({
++            "prompt": first_msg,
++            "prompt_length": len(first_msg),
++        })
++        if max_samples and len(out) >= max_samples:
++            break
++    return out
++
++
++def _extract_lmsys(example: dict) -> Optional[dict]:
++    # lmsys-chat-1m: structure may have "conversation" or similar; use first user turn.
++    conv = example.get("conversation") or example.get("conversations") or []
++    if isinstance(conv, str):
++        return {"prompt": conv[:10000], "prompt_length": len(conv)}
++    for turn in conv:
++        role = (turn.get("role") or turn.get("from") or "").lower()
++        content = turn.get("content") or turn.get("value") or ""
++        if role in ("user", "human") and content.strip():
++            return {"prompt": content[:10000], "prompt_length": len(content)}
++    return None
++
++
++def _extract_wildchat(example: dict) -> Optional[dict]:
++    # WildChat: "conversation" list of {"role", "content"}
++    conv = example.get("conversation") or []
++    for turn in conv:
++        if (turn.get("role") or "").lower() in ("user", "human"):
++            content = turn.get("content") or ""
++            if content.strip():
++                return {"prompt": content[:10000], "prompt_length": len(content)}
++    return None
++
++
++def _extract_oasst(example: dict) -> Optional[dict]:
++    # OpenAssistant: "messages" or "text" / "parent_id" tree
++    msg = example.get("text") or example.get("message") or ""
++    if msg.strip():
++        return {"prompt": msg[:10000], "prompt_length": len(msg)}
++    for key in ("messages", "conversation"):
++        val = example.get(key)
++        if isinstance(val, list) and val:
++            first = val[0]
++            content = first.get("text") or first.get("content") or first.get("value") or ""
++            if content.strip():
++                return {"prompt": content[:10000], "prompt_length": len(content)}
++    return None
++
++
++def _extract_ultrachat(example: dict) -> Optional[dict]:
++    # UltraChat: "messages" list of list [role, content]
++    messages = example.get("messages") or example.get("data") or []
++    for m in messages:
++        if isinstance(m, (list, tuple)) and len(m) >= 2:
++            role, content = m[0], m[1]
++            if (str(role).lower() in ("user", "human")) and str(content).strip():
++                return {"prompt": str(content)[:10000], "prompt_length": len(str(content))}
++        if isinstance(m, dict):
++            role = (m.get("role") or m.get("from") or "").lower()
++            content = m.get("content") or m.get("value") or ""
++            if role in ("user", "human") and content.strip():
++                return {"prompt": content[:10000], "prompt_length": len(content)}
++    return None
++
++
++_EXTRACTORS = {
++    "lmsys": _extract_lmsys,
++    "wildchat": _extract_wildchat,
++    "oasst": _extract_oasst,
++    "ultrachat": _extract_ultrachat,
++}
++
++
++def load_hf_dataset(
++    dataset_name: str,
++    split: str = "train",
++    max_samples: Optional[int] = None,
++    extractor: Optional[str] = None,
++    trust_remote_code: bool = True,
++) -> List[dict]:
++    """
++    Load a Hugging Face dataset and return list of {"prompt", "prompt_length"}.
++    dataset_name: e.g. "lmsys/lmsys-chat-1m", "allenai/WildChat-4.8M".
++    extractor: one of lmsys, wildchat, oasst, ultrachat; auto-detected from SUPPORTED_DATASETS if None.
++    """
++    if not _HF_AVAILABLE:
++        raise RuntimeError("Install 'datasets' to use Hugging Face datasets: pip install datasets")
++    info = SUPPORTED_DATASETS.get(dataset_name)
++    if info is None:
++        if dataset_name == "sharegpt":
++            raise ValueError("Use load_sharegpt() for ShareGPT")
++        extractor = extractor or "lmsys"
++        hf_path = dataset_name
++    else:
++        hf_path, default_split, extractor = info
++        split = split or default_split
++    # Use slice to avoid loading huge splits when max_samples is set
++    split_spec = f"{split}[:{max_samples}]" if max_samples else split
++    ds = load_dataset(hf_path, split=split_spec, trust_remote_code=trust_remote_code)
++    extract_fn = _EXTRACTORS.get(extractor or "lmsys", _extract_lmsys)
++    out = []
++    for ex in ds:
++        row = extract_fn(ex) if callable(extract_fn) else extract_fn(ex)
++        if row:
++            out.append(row)
++    return out
++
++
++def get_prompts_from_dataset(
++    dataset_name: str,
++    project_dir: Optional[str] = None,
++    max_samples: Optional[int] = None,
++    prompt_length_bucket: Optional[str] = None,
++) -> List[dict]:
++    """
++    Unified loader: "sharegpt" loads from local file; otherwise load from Hugging Face.
++    prompt_length_bucket: "short" (<=200 chars), "medium" (200–1000), "long" (>1000), or None for all.
++    """
++    if dataset_name.lower() == "sharegpt":
++        items = load_sharegpt(project_dir=project_dir, max_samples=max_samples)
++    else:
++        items = load_hf_dataset(dataset_name, max_samples=max_samples)
++
++    if prompt_length_bucket:
++        def keep(item: dict) -> bool:
++            L = item.get("prompt_length") or len(item.get("prompt", ""))
++            if prompt_length_bucket == "short":
++                return L <= 200
++            if prompt_length_bucket == "medium":
++                return 200 < L <= 1000
++            if prompt_length_bucket == "long":
++                return L > 1000
++            return True
++        items = [x for x in items if keep(x)]
++    return items
+diff --git a/qlm/workload/metrics.py b/qlm/workload/metrics.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4f3b59bd9b5a2ccd896eee4b252007604c34be06
+--- /dev/null
++++ b/qlm/workload/metrics.py
+@@ -0,0 +1,73 @@
++"""
++Metrics collection for QLM workload experiments: queue length, scheduling delay, backpressure (GPU proxy).
++"""
++
++import json
++import time
++from pathlib import Path
++from typing import Callable, List, Optional
++
++
++class ExperimentMetrics:
++    """
++    Records time-series and per-request metrics for workload sensitivity experiments.
++    """
++
++    def __init__(self):
++        self.queue_length_samples: List[dict] = []  # [{"t": ts, "length": n}, ...]
++        self.scheduling_delays: List[dict] = []     # [{"request_id": id, "delay_ms": x, "t": ts}, ...]
++        self.backpressure_samples: List[dict] = [] # [{"t": ts, "backpressure": n}, ...]
++        self.started_at: Optional[float] = None
++        self.stopped_at: Optional[float] = None
++
++    def start(self) -> None:
++        self.started_at = time.time()
++
++    def stop(self) -> None:
++        self.stopped_at = time.time()
++
++    def record_queue_length(self, length: int) -> None:
++        self.queue_length_samples.append({"t": time.time(), "length": length})
++
++    def record_scheduling_delay(self, request_id: str, insertion_time: float, dispatch_time: float) -> None:
++        delay_ms = (dispatch_time - insertion_time) * 1000.0
++        self.scheduling_delays.append({
++            "request_id": str(request_id),
++            "delay_ms": delay_ms,
++            "insertion_time": insertion_time,
++            "dispatch_time": dispatch_time,
++        })
++
++    def record_backpressure(self, backpressure: float) -> None:
++        self.backpressure_samples.append({"t": time.time(), "backpressure": backpressure})
++
++    def to_dict(self) -> dict:
++        return {
++            "started_at": self.started_at,
++            "stopped_at": self.stopped_at,
++            "duration_sec": (self.stopped_at - self.started_at) if self.stopped_at and self.started_at else None,
++            "queue_length_samples": self.queue_length_samples,
++            "scheduling_delays": self.scheduling_delays,
++            "backpressure_samples": self.backpressure_samples,
++            "summary": self._summary(),
++        }
++
++    def _summary(self) -> dict:
++        delays = [d["delay_ms"] for d in self.scheduling_delays]
++        qlens = [s["length"] for s in self.queue_length_samples]
++        bp = [s["backpressure"] for s in self.backpressure_samples]
++        return {
++            "num_requests_dispatched": len(self.scheduling_delays),
++            "scheduling_delay_ms_mean": sum(delays) / len(delays) if delays else None,
++            "scheduling_delay_ms_p50": sorted(delays)[len(delays) // 2] if delays else None,
++            "scheduling_delay_ms_p99": sorted(delays)[int(len(delays) * 0.99)] if len(delays) > 1 else (delays[0] if delays else None),
++            "queue_length_mean": sum(qlens) / len(qlens) if qlens else None,
++            "queue_length_max": max(qlens) if qlens else None,
++            "backpressure_mean": sum(bp) / len(bp) if bp else None,
++        }
++
++    def save_json(self, path: str) -> None:
++        Path(path).parent.mkdir(parents=True, exist_ok=True)
++        with open(path, "w") as f:
++            json.dump(self.to_dict(), f, indent=2)
++        print(f"Metrics saved to {path}")
+diff --git a/requirements.txt b/requirements.txt
+index 791821cb23b31efd2d0c037ed19dea2f76f2d4ae..6d61d217d825f6b7629ecbfba27632a7f30cdf08 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -32,7 +32,7 @@ lark==1.2.2
+ lm-format-enforcer==0.10.9
+ memray==1.15.0
+ mistral_common==1.5.1
+-mkl-service==2.4.0
++#mkl-service==2.6.1
+ mmh3==4.1.0
+ msgspec==0.19.0
+ multiprocess==0.70.16
+@@ -73,7 +73,7 @@ torch==2.5.1
+ torchaudio==2.5.1
+ torchvision==0.20.1
+ transformers==4.47.1
+-triton==3.1.0
++#triton==3.1.0
+ typing_extensions==4.12.2
+ uvicorn==0.34.0
+ uvloop==0.21.0
+@@ -82,6 +82,6 @@ vllm==0.6.6.post1
+ watchfiles==1.0.3
+ websockets==14.1
+ wheel==0.43.0
+-xformers==0.0.28.post3
+-xgrammar==0.1.8
++# xformers==0.0.28.post3
++#xgrammar==0.1.8
+ xxhash==3.5.0

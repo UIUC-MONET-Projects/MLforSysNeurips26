@@ -1,0 +1,24 @@
+# conversational_qlm: analysis and plotting (phase1_sharegpt.ipynb, generate_phase1_pretty_plots.py)
+#
+# Derived from the imports of the notebook (json, numpy, pandas, matplotlib, seaborn, pathlib) and of
+# generate_phase1_pretty_plots.py (json, sys, pathlib, numpy, and `utils` from pretty-plots).
+# Pinned versions are the ones installed in MONET/QLM/.venv311 (Python 3.11.12, macOS). That
+# environment's matplotlib (3.10.8) matches the Creator metadata of plots_pretty/*.pdf. The notebook's
+# own PNGs record matplotlib 3.10.7, so the notebook ran in a slightly different environment.
+# These pins describe what was observed; nobody has re-run the code with them yet.
+numpy==1.26.4
+pandas==3.0.1
+matplotlib==3.10.8
+seaborn==0.13.2
+jinja2      # unpinned: pandas DataFrame.to_latex (notebook cell 19) needs it
+jupyter     # unpinned: to execute phase1_sharegpt.ipynb
+#
+# pretty-plots is NOT pip-installed: generate_phase1_pretty_plots.py imports `utils` from
+# <repo root>/pretty-plots (https://github.com/raginigupta6/pretty-plots @ 15c2e83ce94502e10719bc9099da3530bd469c6c).
+# Its utils.py needs matplotlib, seaborn and numpy, and expects the "Times New Roman" font.
+#
+# Re-running the GPU experiments also needs the patched QLM checkout (patches/QLM.patch):
+#   pip install -e third_party/QLM     # QLM's own requirements.txt pins vllm==0.6.6.post1, torch==2.5.1, ...
+#   (QLM's requirements.txt also pins gurobipy==12.0.0, which qlm/scheduler/scheduler.py imports at module
+#    level. A Gurobi licence is only needed for the "lp" policy; the default policy is "edf".)
+#   datasets==3.2.0                    # optional: only for Hugging Face prompt datasets (observed in .venv311)

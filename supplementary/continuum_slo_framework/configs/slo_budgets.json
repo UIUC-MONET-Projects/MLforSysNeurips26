@@ -1,0 +1,18 @@
+{
+  "description": "Default SLO budgets in seconds. Tune these after the first measured load sweep.",
+  "job_slo_seconds": {
+    "small": 300,
+    "medium": 1500,
+    "large": 5000
+  },
+  "turn_slo_seconds": {
+    "interactive_ttft": 20,
+    "normal_turn": 60,
+    "final_answer": 300
+  },
+  "policy_weights": {
+    "cache_bonus_seconds_per_hit_pct": 2.0,
+    "aging_bonus_seconds_per_wait_second": 0.05,
+    "rg_hot_bonus_seconds": 5.0
+  }
+}
