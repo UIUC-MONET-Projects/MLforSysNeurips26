@@ -1,6 +1,6 @@
 # Conversational workloads: vLLM vs QLM on ShareGPT
 
-Paper: Section 3.1 (setup), Section 4.1, Table 1 (`tab:chat`), and Appendix A: Table 2 (`tab:full_results`),
+Paper: Section 2.1 (setup), Section 3.1 (results), Table 1 (`tab:chat`), and Appendix A: Table 2 (`tab:full_results`),
 Figures 4–6 (`fig:app_delay`, `fig:queue_regimes`, `fig:app_prompt`). The source is MONET `monet_research/`.
 Every MONET commit touching it is by Neil Teje.
 
@@ -67,11 +67,21 @@ short/long buckets (≤200 / >1000 chars) are filtered from those 1,000.
 1. **The vLLM and QLM conditions run the same command.** In `scripts/phase1_runner.sh`, `run_vllm_experiment` and
    `run_qlm_experiment` run the same `python benchmarks/workload_driver.py ...` command line. `workload_driver.py`
    always sends requests through QLM's `Queue`. Neither script sets `QLM_SCHEDULER_POLICY` (default `edf`) or `--slo`
-   (default 1000 s for every request). The result JSONs carry no system identifier. Nothing in MONET records how the
+   (default 1000 s for every request). With one model and one SLO there is a single QLM request group, so EDF
+   reordering has nothing to reorder. The result JSONs carry no system identifier. Nothing in MONET records how the
    "vLLM" runs were configured differently from the "QLM" runs. The deleted MONET doc
    `04f8583^:monet_research/docs/QUICKSTART.md` also lists identical commands for E1.1 and E1.2.
-2. **Scheduling delay** is measured inside QLM's queue for both conditions: from `push()` (insertion time) to
-   dispatch to the vLLM worker (`ExperimentMetrics.record_scheduling_delay`). It excludes model execution.
+2. **Scheduling delay is not the time since arrival.** `ExperimentMetrics.record_scheduling_delay` (in
+   `patches/QLM.patch`) records `dispatch_time - request.insertion_time`. Upstream QLM's `Scheduler._update_all_slos`
+   (`qlm/scheduler/scheduler.py`, line 45 after patching; not changed by the patch) sets
+   `request.insertion_time = curr_time` for every queued request, and `Queue.run_queue` reaches it on every loop
+   iteration (`reorder_vqs()` -> `check_violation()`). QLM's own `push()` docstring says the insertion time "can be
+   updated during request lifetime". The recorded value is therefore the time since the start of the latest loop
+   iteration, which is mostly the three blocking `/metrics` reads in `get_backpressure()`, not the time since `push()`.
+   Evidence in the shipped data: in every run, each dispatched request's recorded `insertion_time` is later than the
+   previous dispatch (286/286 in E1.7, despite a queue of several hundred requests), and at 16 req/s the recorded mean
+   delay is 0.033 s while the mean queue (334 requests at about 4.8 dispatches/s) implies about 70 s by Little's law.
+   The value excludes model execution.
 3. **p99 definition.** `qlm/workload/metrics.py` (in `patches/QLM.patch`) computes p99 as `sorted(delays)[int(0.99*n)]` and
    p50 as `sorted(delays)[n//2]`. With n = 120 requests, p99 is the 2nd-largest delay. NumPy-style interpolation would give
    131.97 ms instead of 151.16 ms for E1.1. Recomputing the mean from the raw `scheduling_delays` matches the stored summary
@@ -82,3 +92,12 @@ short/long buckets (≤200 / >1000 chars) are filtered from those 1,000.
    In most of their workloads only 1–5 requests were dispatched.
 5. The notebook's saved outputs predate packaging: its "All plots saved to" line shows the original
    `MONET/analysis/plots` location (path redacted).
+6. **One request in flight.** `Queue.run_queue` awaits each blocking `worker.add_request` (an OpenAI
+   `completions.create` call) before it dispatches the next request. The recorded `backpressure_samples`
+   (`vllm:num_requests_running + waiting + swapped`, sampled every 0.25 s) never exceed 1.0 in any of the 12 runs.
+   The plateau near 4.8 req/s at 5 and 16 req/s is therefore the rate of this serial client (mean gap between dispatches
+   about 208-210 ms in E1.7/E1.8), not a measured GPU limit.
+7. **Output length.** `qlm/queue/worker.py` calls `completions.create(model=..., prompt=...)` without `max_tokens`.
+   vLLM's OpenAI-compatible completions endpoint defaults to 16 output tokens (`max_tokens: Optional[int] = 16` in
+   `CompletionRequest`, e.g. `vllm/entrypoints/openai/protocol.py` of the vllm-continuum base commit), so outputs were
+   most likely capped at 16 tokens. The Phase-1 vLLM version is not recorded, and the JSONs store no output lengths.

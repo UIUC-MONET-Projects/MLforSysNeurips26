@@ -3,8 +3,9 @@
 This repository holds the code and data the team wrote for the paper *"From Conversational Chats to Agents:
 Workload-Dependent Bottleneck Shifts in LLM Serving"*. The paper source is `MLSYS2/neurips_2026.tex` in the team's working
 repository; its header calls it a "NeurIPS ML for Systems workshop extended abstract", and a commented-out author block lists
-Ragini Gupta, Neil Teje and Klara Nahrstedt (UIUC). The paper compares a common vLLM baseline against two serving
-mechanisms. (1) QLM's queue-aware, SLO-oriented scheduling, on six ShareGPT conversational workloads with
+Ragini Gupta, Neil Teje and Klara Nahrstedt (UIUC). OpenReview lists it (`mTDnSps98P`) as an "MLForSys2026 Poster" with
+those three authors. The paper describes two comparisons against what it calls a common vLLM baseline (see Known
+gaps 5 and 9 for what the code and data show). (1) QLM's queue-aware, SLO-oriented scheduling, on six ShareGPT conversational workloads with
 Llama-3.2-1B-Instruct. (2) "Continuum"-style cross-turn reuse, on ten HyperAgent software-engineering traces from MAST, replayed
 against Qwen2.5-Coder-14B-Instruct. Everything here was extracted from the team's working repository, called **MONET** below.
 Public upstream packages (QLM, HyperAgent, vllm-continuum, MAST, pretty-plots) are not included: they are referenced by URL
@@ -47,7 +48,7 @@ code or source data found anywhere in MONET).
 | Fig. 5 `fig:queue_regimes` (`plot2_queue_length_over_time.png`) | same script | `conversational_qlm/results/phase1/*` (baseline, high-rate, bursty, multi-user); `conversational_qlm/plots_pretty/plot2_*.png` | reproducible | The paper version has its panel titles removed by hand (no code) |
 | Fig. 6 `fig:app_prompt` (`plot4_prompt_length_sensitivity.png`) | same script | `conversational_qlm/results/phase1/*` (short, mixed, long); `conversational_qlm/plots_pretty/plot4_*.png` | reproducible | The paper version is cropped by hand (titles removed) |
 | Fig. 1 `fig:prefill` (`result1 (1).jpeg`) | **missing**. Upstream data step: `ha-trace-replay` / `ha-trace-replay-reuse` / `ha-trace-analyze-reuse` | `agentic_continuum/results/plots/07_prefill_decode.png` (uncropped source image), `agentic_continuum/results/data/instance_summary.csv`, `agentic_continuum/hyperagent-replay/reuse-analysis/pairwise_comparison.csv`, raw `agentic_continuum/hyperagent-replay/replays-two/` | data-only | Token totals match the replay JSONs exactly. "Continuum" = client-side exact-repeat reuse replay; see Known gaps 1–2 |
-| Fig. 2 `fig:cache_hits` (`result2 (1).jpeg`) | **missing** (same upstream data step) | `agentic_continuum/results/plots/20_running_hit_rate.png`, `agentic_continuum/results/data/full_trace_per_turn.csv` (`cache_hit`), `agentic_continuum/hyperagent-replay/replays-two/*.reuse.replay.json` | data-only | Final rates 31/44/41/0/0/7/5/17/36/0 % match the data. "Window avg" size unknown |
+| Fig. 2 `fig:cache_hits` (`result2 (1).jpeg`) | **missing** (same upstream data step) | `agentic_continuum/results/plots/20_running_hit_rate.png`, `agentic_continuum/results/data/full_trace_per_turn.csv` (`cache_hit`), `agentic_continuum/hyperagent-replay/replays-two/*.reuse.replay.json` | data-only | Final rates 31/44/41/0/0/7/5/17/36/0 % match the data. "Window avg" size unknown. The plotted per-turn curves could not be reproduced from the hit flags in any shipped file (`agentic_continuum/README.md` caveat 8) |
 | Fig. 3 `fig:jct` (`result3.jpeg`) | **missing** (same upstream data step) | `agentic_continuum/results/plots/16_cumulative_jct_waterfall.png` (same pixel size), `agentic_continuum/results/plots/summary_table.csv` (= `pairwise_comparison.csv`) | data-only | Data: 171.02 → 111.49 min (−34.8 %). The paper text says 162 → 105 min |
 | Table 3 `tab:agent_jct` (appendix) | none | none | code-missing | Its 9 rows (75…162 / 40…105, no astropy-14365) appear in no MONET file and do not match the recomputed series in `agentic_continuum/README.md` |
 
@@ -106,11 +107,18 @@ with the snippets in the two component READMEs. The 35 % reduction is consistent
 4. **Table 3 and the 162 → 105 min totals cannot be reproduced** from any file. The data gives 171.02 → 111.49 min.
 5. **Phase 1: nothing distinguishes the "vLLM" runs from the "QLM" runs.** The runner issues identical commands for both, and
    the driver always goes through QLM's queue. p99 is a nearest-rank value: the 2nd-largest of 120 delays.
+   The recorded "scheduling delay" is not the time since arrival: QLM's scheduler rewrites `insertion_time` on every queue
+   loop, so the value is about one `/metrics` poll. The client keeps one request in flight (server backpressure never
+   exceeds 1.0), and requests carry no `max_tokens` (vLLM's completions default is 16). See `conversational_qlm/README.md`
+   caveats 2, 6 and 7.
 6. Paper figures 1–3 and 5–6 were cropped or converted by hand. The paper PDF/tex and figure files are not shipped.
 7. Baseline and reuse replays of a trace ran on different days with different context-budget settings (max_model_len
    32768 vs null for the two largest traces).
 8. Credentials: a Gurobi WLS id/secret in MONET's `QLM/qlm/config.yaml` is redacted in `patches/QLM.patch`. It remains in
-   MONET's git history.
+   MONET's git history. The authors should revoke or rotate it.
+9. **The two experiments share no common configuration.** Experiment 1: `unsloth/Llama-3.2-1B-Instruct`, the completions
+   API through QLM's queue, vLLM version unrecorded. Experiment 2: `Qwen/Qwen2.5-Coder-14B-Instruct`, the chat API with
+   512 output tokens, vLLM 0.18.1 (logged for two baseline runs) with prefix caching enabled.
 
 ## Packaging checks (run before the commit)
 
@@ -130,6 +138,9 @@ with the snippets in the two component READMEs. The 35 % reduction is consistent
   default data paths in this layout. The simulator was smoke-run with output written outside the repository.
 * Every path-like token in the five READMEs resolves to a file in this repo, a MONET path described as such, a file in a
   patched upstream checkout, a directory the instructions create, or a deliberately non-existent/non-path reference.
+* A later verification pass redacted one NCSA compute-node IP address in `replays-two/vllm.log` and corrected several
+  README statements (section numbers, the Phase-1 delay definition, the `results/data` hit flags, Fig. 2). See
+  `PROVENANCE.md` and the git log.
 
 ## Contributors (from git history)
 

@@ -1,6 +1,6 @@
 # Agentic workloads: HyperAgent trace replay ("vLLM vs Continuum")
 
-Paper: Section 3.2 (setup), Sections 4.2–4.4, Figure 1 (`fig:prefill`, `result1 (1).jpeg`), Figure 2
+Paper: Section 2.2 (setup), Sections 3.2–3.4, Figure 1 (`fig:prefill`, `result1 (1).jpeg`), Figure 2
 (`fig:cache_hits`, `result2 (1).jpeg`), Figure 3 (`fig:jct`, `result3.jpeg`), Appendix B Table 3 (`tab:agent_jct`).
 
 | Path | What | Source in MONET | Authors (git) |
@@ -37,8 +37,9 @@ MAST traces/HyperAgent/<id>_human.json
 
 Evidence for the last two steps:
 * `results/plots/summary_table.csv` equals `reuse-analysis/pairwise_comparison.csv` on all 140 shared values.
-* `results/data/full_trace_per_turn.csv` matches the replay JSONs turn by turn for `stock_vllm` (930 rows) and,
-  for `continuum`, in `prompt_tokens` and `cache_hit` (caveat 4 covers latencies).
+* `results/data/full_trace_per_turn.csv` matches the baseline replay JSONs turn by turn for `stock_vllm` (930 rows:
+  prompt tokens, completion tokens, latency). For `continuum` it matches the reuse replays in `prompt_tokens` on all 626
+  executed turns, but not in `cache_hit` (158 turns differ; see caveat 4) or latency.
 * `result3.jpeg` has the same pixel size as `16_cumulative_jct_waterfall.png` (1548×638). `result1 (1).jpeg` and `result2 (1).jpeg`
   are `07_prefill_decode.png` and `20_running_hit_rate.png` with their titles cropped off, resized to 1600 px wide.
 * A Spotlight (`mdfind`) search of the authoring machine for these file names returned only the PNG itself. `results/plots_v3/KEY_FINDINGS.md` cites
@@ -105,8 +106,10 @@ Their defaults keep the stock request payload.
 3. **Baseline server configuration.** The only server log, `replays-two/vllm.log`, covers the 2026-04-08 baseline runs of
    astropy-12907 and astropy-14365. It shows stock vLLM 0.18.1 with `enable_prefix_caching=True`; the logged "Prefix cache hit rate" reaches
    95.2 % (647 log lines). The non-default args are only model, host and `max_model_len` 32768, with no scheduling-policy flag.
-4. **`results/data` "continuum" latencies do not match any measured run.** For `condition == continuum`,
-   `full_trace_per_turn.csv` matches `*.reuse.replay.json` in `prompt_tokens` and `cache_hit`, but `request_latency_s`
+4. **`results/data` "continuum" latencies and hit flags do not match the measured runs.** For `condition == continuum`,
+   `full_trace_per_turn.csv` matches `*.reuse.replay.json` in `prompt_tokens` on the 626 executed turns, but its
+   `cache_hit` flag differs on 158 turns: it counts 76 hits for astropy-14365 (replay: 169), 17 for astropy-6938
+   (replay: 47) and 7 for matplotlib-24334 (replay: 42); the other seven traces agree. `request_latency_s`
    differs in 926 of 930 rows. Over the 626 executed turns, the CSV/replay ratio has median 0.629 (range 0.465–1.101);
    for example, astropy-12907 turn 0 is 13.4626 s in the CSV and 18.4597 s in the replay. Cache-hit turns have small non-zero
    CSV latencies where the replay records 0.0. `instance_summary.csv` "continuum" `total_wall_time_s` sums to 77.25 min,
@@ -118,10 +121,17 @@ Their defaults keep the stock request payload.
    46 trimmed turns, 335 context-retry events (`max_model_len` null). astropy-12907: 28 vs 10 trimmed turns, 0 vs 31 retries.
 6. **"Prefill tokens"** in Fig. 1 are summed `usage.prompt_tokens` of the requests that were actually sent. The reduction
    equals the prompt tokens of turns served from the client-side cache, plus any budgeting differences (caveat 5).
+   Because whole requests are skipped, decode (completion) tokens fall too: 148,424 -> 101,040 overall (-31.9 %) and
+   -32.5 % to -43.6 % on the four reuse-heavy traces. `usage.prompt_tokens` includes tokens served from vLLM's prefix
+   cache; no replay records `cached_tokens`.
 7. **Paper numbers that do not match the data.** The paper states a cumulative completion time of 162 → 105 min. The data
    gives 171.02 → 111.49 min (Fig. 3 itself ends near 171 / 112). Table 3's values (9 rows, no astropy-14365, ending 162 / 105)
    appear in no file in MONET and do not match the recomputed series above.
 8. Fig. 2's running hit rate is labelled "window avg" in the uncropped PNG. The window size cannot be recovered because the code is missing.
+   Only the dashed "final" values can be reproduced (hits/turns from the reuse replays). The plotted per-turn curves do not
+   follow from the hit flags in the replays or in `results/data/*.csv`: matplotlib-18869 has hits at turns 34-35 but its
+   panel stays at 0 %; astropy-12907's 36 hits all fall in turns 14-61, while its panel is 0 % until about turn 47 and
+   peaks after turn 100; matplotlib-24265's hits are at turns 3-9, while its panel also shows 33 % plateaus near turns 23-29.
 9. Licence: MAST has no LICENSE file. `extracted-two/` and the `request_messages` inside `replays-two/` contain MAST-derived
    text (including SWE-bench issue text that quotes third-party home-directory paths, e.g. in the seaborn-3407 and pylint-6506
    inputs; these come verbatim from MAST and were left unchanged).
